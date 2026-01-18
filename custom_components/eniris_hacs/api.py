@@ -60,14 +60,18 @@ class EnirisHacsApiClient:
         is_text_response: bool = False,
     ) -> Any:
         """Make an API request."""
-        _LOGGER.debug(
-            "Request: %s %s, Headers: %s, Data: %s", method, url, headers, data
-        )
+
+        def _truncate(value: str, limit: int = 300) -> str:
+            value = value.replace("\n", " ").replace("\r", " ")
+            return value if len(value) <= limit else f"{value[:limit]}…"
+
+        # Intentionally do NOT log headers/body here: it can contain passwords and bearer tokens.
+        _LOGGER.debug("Request: %s %s", method, url)
         try:
             async with self._session.request(
                 method, url, headers=headers, json=data
             ) as response:
-                _LOGGER.debug("Response status: %s, for URL: %s", response.status, url)
+                _LOGGER.debug("Response status: %s for %s", response.status, url)
                 if response.status == 200 or response.status == 201:
                     if is_text_response:
                         return await response.text()
@@ -79,26 +83,22 @@ class EnirisHacsApiClient:
                             e,
                         )
                         return await response.text()
-                elif response.status in (401, 403):
+
+                body_text = await response.text()
+                if response.status in (401, 403):
                     _LOGGER.error(
-                        "Authentication error %s for %s: %s",
-                        response.status,
-                        url,
-                        await response.text(),
+                        "Authentication error %s for %s", response.status, url
                     )
+                    _LOGGER.debug("Auth error response body: %s", _truncate(body_text))
                     raise EnirisHacsAuthError(
-                        f"Authentication failed ({response.status}): {await response.text()}"
+                        f"Authentication failed ({response.status}): {_truncate(body_text)}"
                     )
-                else:
-                    _LOGGER.error(
-                        "API request failed %s for %s: %s",
-                        response.status,
-                        url,
-                        await response.text(),
-                    )
-                    raise EnirisHacsApiError(
-                        f"API request failed ({response.status}): {await response.text()}"
-                    )
+
+                _LOGGER.error("API request failed %s for %s", response.status, url)
+                _LOGGER.debug("API error response body: %s", _truncate(body_text))
+                raise EnirisHacsApiError(
+                    f"API request failed ({response.status}): {_truncate(body_text)}"
+                )
         except ClientConnectorError as e:
             _LOGGER.error("Connection error during API request to %s: %s", url, e)
             raise EnirisHacsApiError(f"Connection error: {e}") from e
@@ -115,7 +115,7 @@ class EnirisHacsApiClient:
 
     async def get_refresh_token(self) -> str:
         """Get a refresh token."""
-        _LOGGER.info("Attempting to get refresh token for user %s", self._email)
+        _LOGGER.debug("Getting refresh token for %s", self._email)
         payload = {"username": self._email, "password": self._password}
         try:
             response_text = await self._request(
@@ -128,7 +128,7 @@ class EnirisHacsApiClient:
             if response_text:
                 # Clean up the response text - remove any whitespace and quotes
                 self._refresh_token = response_text.strip().strip('"')
-                _LOGGER.info("Successfully obtained refresh token.")
+                _LOGGER.debug("Successfully obtained refresh token.")
                 return self._refresh_token
             _LOGGER.error("Failed to get refresh token: Empty response.")
             raise EnirisHacsAuthError("Failed to get refresh token: Empty response")
@@ -139,14 +139,14 @@ class EnirisHacsApiClient:
     async def get_access_token(self) -> str:
         """Get an access token using the refresh token."""
         if not self._refresh_token:
-            _LOGGER.info("No refresh token available, fetching new one.")
+            _LOGGER.debug("No refresh token cached; logging in to obtain one.")
             await self.get_refresh_token()  # This will raise if it fails
 
         if not self._refresh_token:  # Should not happen if above call succeeded
             _LOGGER.error("Refresh token is still missing after attempting to fetch.")
             raise EnirisHacsAuthError("Refresh token is missing.")
 
-        _LOGGER.info("Attempting to get access token.")
+        _LOGGER.debug("Getting access token using refresh token.")
         headers = {"Authorization": f"Bearer {self._refresh_token}"}
         try:
             response_data = await self._request(
@@ -155,12 +155,12 @@ class EnirisHacsApiClient:
             if isinstance(response_data, str):
                 # Handle plain text response
                 self._access_token = response_data.strip().strip('"')
-                _LOGGER.info("Successfully obtained access token from text response.")
+                _LOGGER.debug("Successfully obtained access token.")
                 return self._access_token
             if isinstance(response_data, dict) and "accessToken" in response_data:
                 # Handle JSON response
                 self._access_token = response_data["accessToken"]
-                _LOGGER.info("Successfully obtained access token from JSON response.")
+                _LOGGER.debug("Successfully obtained access token (JSON response).")
                 return self._access_token
             _LOGGER.error(
                 "Failed to get access token: Invalid response format. Response: %s",
@@ -172,12 +172,15 @@ class EnirisHacsApiClient:
         except EnirisHacsApiError as e:
             _LOGGER.error("Error obtaining access token: %s", e)
             self._access_token = None
+            # If the refresh token is no longer accepted, drop it so the next attempt re-logins.
+            if isinstance(e, EnirisHacsAuthError):
+                self._refresh_token = None
             raise EnirisHacsAuthError(f"Failed to obtain access token: {e}") from e
 
     async def ensure_access_token(self) -> str:
         """Ensure a valid access token is available, refreshing if necessary."""
         if not self._access_token:
-            _LOGGER.info("Access token is missing, obtaining new one.")
+            _LOGGER.debug("Access token missing; obtaining a new one.")
             await self.get_access_token()
 
         if not self._access_token:
@@ -189,7 +192,7 @@ class EnirisHacsApiClient:
         """Get a list of devices."""
         access_token = await self.ensure_access_token()
         headers = {"Authorization": f"Bearer {access_token}"}
-        _LOGGER.info("Fetching devices from Eniris HACS API.")
+        _LOGGER.debug("Fetching devices from Eniris API.")
         try:
             response_data = await self._request("GET", DEVICES_URL, headers=headers)
             if (
@@ -198,7 +201,7 @@ class EnirisHacsApiClient:
                 and isinstance(response_data["device"], list)
             ):
                 devices = response_data["device"]
-                _LOGGER.info("Successfully fetched %s devices.", len(devices))
+                _LOGGER.debug("Fetched %s devices.", len(devices))
                 return devices
             _LOGGER.warning(
                 "No 'device' list found in API response or response is not as expected. Response: %s",
@@ -210,8 +213,8 @@ class EnirisHacsApiClient:
             # If it's an auth error, it might mean the access token expired mid-flight.
             # A more robust system might retry getting an access token once.
             if isinstance(e, EnirisHacsAuthError):
-                _LOGGER.info(
-                    "Auth error during device fetch, attempting to refresh access token once."
+                _LOGGER.debug(
+                    "Auth error during device fetch; retrying once with a new access token."
                 )
                 self._access_token = None  # Clear current access token to force refresh
                 access_token = await self.ensure_access_token()  # Retry getting token
@@ -653,9 +656,7 @@ class EnirisHacsApiClient:
                                         )
                                         dt_obj = None
                                 if dt_obj:
-                                    result["timestamp"] = dt_obj.replace(
-                                        tzinfo=UTC
-                                    )
+                                    result["timestamp"] = dt_obj.replace(tzinfo=UTC)
                         return result
                 except Exception as retry_error:
                     _LOGGER.error(
