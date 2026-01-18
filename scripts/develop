@@ -4,10 +4,31 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-# Create config dir if not present
-if [[ ! -d "${PWD}/config" ]]; then
-    mkdir -p "${PWD}/config"
-    hass --config "${PWD}/config" --script ensure_config
+CONFIG_DIR="${PWD}/config/dev"
+
+mkdir -p "$CONFIG_DIR"
+
+# Create a minimal dev configuration (avoids `default_config`, which currently depends
+# on `go2rtc` and requires a docker binary/socket in many dev-container setups).
+if [[ ! -f "${CONFIG_DIR}/configuration.yaml" ]]; then
+        cat >"${CONFIG_DIR}/configuration.yaml" <<'EOF'
+homeassistant:
+    debug: true
+
+# Minimal set for UI + API in dev
+api:
+frontend:
+http:
+
+automation:
+script:
+scene:
+
+logger:
+    default: info
+    logs:
+        custom_components.eniris_hacs: debug
+EOF
 fi
 
 # Set the path to custom_components
@@ -17,4 +38,4 @@ fi
 export PYTHONPATH="${PYTHONPATH}:${PWD}/custom_components"
 
 # Start Home Assistant
-hass --config "${PWD}/config" --debug
+hass --config "$CONFIG_DIR" --debug
