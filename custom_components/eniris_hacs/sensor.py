@@ -412,10 +412,6 @@ def get_value_from_conceptual_measurements(data: dict[str, Any], key: str) -> An
     # This is where you would look up the live value.
     # For now, we return None, so these sensors will be 'unknown'.
     # Example: return data.get("latest_measurements", {}).get(key)
-    _LOGGER.debug(
-        "Attempting to get conceptual measurement for key '%s'. Live data fetch not implemented.",
-        key,
-    )
     return None
 
 
@@ -441,6 +437,17 @@ async def async_setup_entry(
         node_type = properties.get("nodeType")
         device_info_block = properties.get("info", {})
         latest_data = device_data.get("_latest_data", {})
+
+        series_configs = properties.get("nodeInfluxSeries", [])
+        available_telemetry_fields: set[str] = set()
+        for series_cfg in series_configs:
+            fields = (
+                series_cfg.get("fields", []) if isinstance(series_cfg, dict) else []
+            )
+            if isinstance(fields, list):
+                for field in fields:
+                    if isinstance(field, str):
+                        available_telemetry_fields.add(field)
 
         # 1. Add sensors based on properties.info (COMMON SENSORS)
         for (
@@ -477,29 +484,44 @@ async def async_setup_entry(
             DEVICE_TYPE_BATTERY,
             DEVICE_TYPE_HYBRID_INVERTER,
         ]:
-            for entity_desc_tuple in (
-                IMPORT_EXPORT_POWER_SENSORS
-            ):  # (base_key, name_suffix, unit, dev_class, state_class, icon, ent_cat)
-                # These are special base_keys ("import_power", "export_power") handled in _update_internal_state
-                entities_to_add.append(
-                    EnirisHacsSensor(
-                        coordinator,
-                        device_data,
-                        entity_description_tuple=entity_desc_tuple,
-                        retention_policy_tag="rp_one_m",
-                        data_type_tag="latest",  # Import/Export power is always a 'latest' type value
+            # Derived from `actualPowerTot_W`; don't create if the field isn't available.
+            if "actualPowerTot_W" in available_telemetry_fields:
+                for entity_desc_tuple in IMPORT_EXPORT_POWER_SENSORS:  # (base_key, name_suffix, unit, dev_class, state_class, icon, ent_cat)
+                    # These are special base_keys ("import_power", "export_power") handled in _update_internal_state
+                    entities_to_add.append(
+                        EnirisHacsSensor(
+                            coordinator,
+                            device_data,
+                            entity_description_tuple=entity_desc_tuple,
+                            retention_policy_tag="rp_one_m",
+                            data_type_tag="latest",  # Import/Export power is always a 'latest' type value
+                        )
                     )
-                )
         # 1c. Add Charging/Discharging Power sensors for all batteries and hybrid inverters
         if node_type in [DEVICE_TYPE_BATTERY, DEVICE_TYPE_HYBRID_INVERTER]:
-            for entity_desc_tuple in BATTERY_CHARGE_DISCHARGE_SENSORS:
-                entities_to_add.append(
-                    EnirisHacsSensor(
-                        coordinator,
-                        device_data,
-                        entity_description_tuple=entity_desc_tuple,
-                    )
+            # Charging/discharging are derived from `actualPowerTot_W` for standalone batteries,
+            # or summed from child batteries for hybrid inverters.
+            has_child_battery = any(
+                child.get("properties", {}).get("nodeType") == DEVICE_TYPE_BATTERY
+                for child in device_data.get("_processed_children", [])
+                if isinstance(child, dict)
+            )
+            if node_type == DEVICE_TYPE_HYBRID_INVERTER:
+                allow_charge_discharge = has_child_battery
+            else:
+                allow_charge_discharge = (
+                    "actualPowerTot_W" in available_telemetry_fields
                 )
+
+            if allow_charge_discharge:
+                for entity_desc_tuple in BATTERY_CHARGE_DISCHARGE_SENSORS:
+                    entities_to_add.append(
+                        EnirisHacsSensor(
+                            coordinator,
+                            device_data,
+                            entity_description_tuple=entity_desc_tuple,
+                        )
+                    )
 
         # 2. Add sensors based on telemetry measurements for the primary device
         if node_type in CONCEPTUAL_MEASUREMENT_SENSORS:
@@ -512,6 +534,9 @@ async def async_setup_entry(
                 icon,
                 ent_cat,
             ) in CONCEPTUAL_MEASUREMENT_SENSORS[node_type]:
+                # Only create telemetry sensors that are actually available for this node.
+                if m_key not in available_telemetry_fields:
+                    continue
                 entity_desc_tuple_base = (
                     m_key,
                     name_suffix,
@@ -522,24 +547,29 @@ async def async_setup_entry(
                     ent_cat,
                 )
 
-                # Determine data type: sum for energy, latest for others
-                data_type_for_m_key = (
-                    "sum" if "Energy" in m_key or "Energy" in name_suffix else "latest"
-                )
+                # Only expose latest values; sums have been removed.
+                data_type_for_m_key = "latest"
 
                 # Create sensors for each retention policy defined in api.py (e.g., rp_one_m, rp_one_s)
                 # Assuming api.py defines retention_policies = ["rp_one_m", "rp_one_s"]
                 # If stateOfCharge_frac, only create one sensor (uses rp_one_m by default in class)
                 if m_key == "stateOfCharge_frac":
-                    entities_to_add.append(
-                        EnirisHacsSensor(
-                            coordinator,
-                            device_data,
-                            entity_description_tuple=entity_desc_tuple_base,
-                            # retention_policy_tag is None, uses default rp_one_m logic in class
-                            data_type_tag="latest",  # SoC is always a latest value
+                    # For inverters, SoC is usually available via child batteries; only add if a child battery exists.
+                    if node_type != DEVICE_TYPE_HYBRID_INVERTER or any(
+                        child.get("properties", {}).get("nodeType")
+                        == DEVICE_TYPE_BATTERY
+                        for child in device_data.get("_processed_children", [])
+                        if isinstance(child, dict)
+                    ):
+                        entities_to_add.append(
+                            EnirisHacsSensor(
+                                coordinator,
+                                device_data,
+                                entity_description_tuple=entity_desc_tuple_base,
+                                # retention_policy_tag is None, uses default rp_one_m logic in class
+                                data_type_tag="latest",  # SoC is always a latest value
+                            )
                         )
-                    )
                 else:
                     entities_to_add.append(
                         EnirisHacsSensor(
@@ -557,6 +587,17 @@ async def async_setup_entry(
             child_node_type = child_properties.get("nodeType")
             child_info_block = child_properties.get("info", {})
             child_latest_data = child_device_data.get("_latest_data", {})
+
+            child_series_configs = child_properties.get("nodeInfluxSeries", [])
+            child_available_telemetry_fields: set[str] = set()
+            for series_cfg in child_series_configs:
+                fields = (
+                    series_cfg.get("fields", []) if isinstance(series_cfg, dict) else []
+                )
+                if isinstance(fields, list):
+                    for field in fields:
+                        if isinstance(field, str):
+                            child_available_telemetry_fields.add(field)
 
             # 3a. Common sensors for the child device (from its own info block)
             for (
@@ -597,6 +638,8 @@ async def async_setup_entry(
                     icon,
                     ent_cat,
                 ) in CONCEPTUAL_MEASUREMENT_SENSORS[child_node_type]:
+                    if m_key not in child_available_telemetry_fields:
+                        continue
                     entity_desc_tuple_base = (
                         m_key,
                         name_suffix,
@@ -606,11 +649,8 @@ async def async_setup_entry(
                         icon,
                         ent_cat,
                     )
-                    data_type_for_m_key = (
-                        "sum"
-                        if "Energy" in m_key or "Energy" in name_suffix
-                        else "latest"
-                    )
+                    # Only expose latest values; sums have been removed.
+                    data_type_for_m_key = "latest"
 
                     if m_key == "stateOfCharge_frac":  # SoC special handling for child
                         entities_to_add.append(
@@ -650,7 +690,7 @@ class EnirisHacsSensor(EnirisHacsEntity, SensorEntity):
         primary_device_data: dict[str, Any],
         entity_description_tuple: tuple,  # (base_key, name_suffix, unit, dev_class, state_class, icon, ent_cat)
         retention_policy_tag: str | None = None,  # e.g., "rp_one_m"
-        data_type_tag: str = "latest",  # "latest" or "sum"
+        data_type_tag: str = "latest",  # "latest" only
         child_device_data: dict[str, Any] | None = None,
         is_info_sensor: bool = False,
     ):
@@ -668,7 +708,7 @@ class EnirisHacsSensor(EnirisHacsEntity, SensorEntity):
         self._retention_policy_tag = (
             retention_policy_tag  # e.g., "rp_one_m" or None for info sensors
         )
-        self._data_type_tag = data_type_tag  # "latest" or "sum"
+        self._data_type_tag = data_type_tag  # "latest" only
         self._is_info_sensor = is_info_sensor
 
         # Determine the device name prefix (either from child or parent)
@@ -690,11 +730,7 @@ class EnirisHacsSensor(EnirisHacsEntity, SensorEntity):
         name_suffix_adjusted = self._name_suffix
         if self._retention_policy_tag == "rp_one_m":
             name_suffix_adjusted = f"{self._name_suffix} (1m)"
-        # If it's a sum, add that too, unless already specific
-        if (
-            self._data_type_tag == "sum" and "Energy" not in self._name_suffix
-        ):  # Energy already implies sum
-            name_suffix_adjusted = f"{name_suffix_adjusted} Sum"
+        # Sum telemetry values are no longer supported.
 
         self._value_key_for_unique_id = f"{self._base_value_key}{key_suffix}"
 
@@ -769,7 +805,6 @@ class EnirisHacsSensor(EnirisHacsEntity, SensorEntity):
         if current_device_data_for_sensor is None:
             # Do not change state if coordinator data for this device is missing entirely.
             # Availability is handled by the EnirisHacsEntity base class.
-            # _LOGGER.debug("Sensor %s: No current data from coordinator for this device. State not changed.", self.unique_id)
             return
 
         latest_data_source = current_device_data_for_sensor.get("_latest_data", {})
@@ -986,13 +1021,9 @@ class EnirisHacsSensor(EnirisHacsEntity, SensorEntity):
         if value_is_available_for_update:
             if self._attr_native_value != new_sensor_value:
                 self._attr_native_value = new_sensor_value
-                # _LOGGER.debug("Sensor %s updated native_value to: %s", self.unique_id, self._attr_native_value) # Optional: for debugging
-        # else:
-        # _LOGGER.debug("Sensor %s: No new specific data available in this update cycle. State preserved: %s", self.unique_id, self._attr_native_value) # Optional: for debugging
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        _LOGGER.debug("Coordinator update received for sensor: %s", self.unique_id)
         self._update_internal_state()
         super()._handle_coordinator_update()  # Updates availability and calls async_write_ha_state

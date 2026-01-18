@@ -39,7 +39,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         try:
             # Note: get_processed_devices already handles token refresh internally
             devices = await api_client.get_processed_devices()
-            _LOGGER.debug("Coordinator update: %s devices processed", len(devices))
         except EnirisHacsAuthError as err:
             # This will trigger re-authentication flow if implemented,
             # or just log an error and fail the update.
@@ -89,7 +88,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         api_client = hass.data[DOMAIN][entry.entry_id].get("api_client")
         if api_client:
-            await api_client.close()  # Close the aiohttp session
+            await api_client.close()
         hass.data[DOMAIN].pop(entry.entry_id)
         _LOGGER.info("Eniris HACS integration unloaded for %s", entry.title)
 

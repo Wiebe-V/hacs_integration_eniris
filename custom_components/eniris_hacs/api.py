@@ -2,6 +2,7 @@
 
 import copy
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -22,6 +23,63 @@ _LOGGER = logging.getLogger(__name__)
 # HTTP status codes
 _HTTP_OK = 200
 _HTTP_CREATED = 201
+
+
+_FRACTIONAL_SECONDS_RE = re.compile(r"\.(\d+)")
+
+
+def _summarize_for_log(value: Any) -> str:
+    """Return a small, non-spammy summary suitable for WARNING/INFO logs."""
+    if value is None:
+        return "None"
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        preview = keys[:25]
+        suffix = "…" if len(keys) > len(preview) else ""
+        return f"dict(keys={preview}{suffix})"
+    if isinstance(value, list):
+        return f"list(len={len(value)})"
+    if isinstance(value, str):
+        return f"str(len={len(value)})"
+    return type(value).__name__
+
+
+def _normalize_iso8601(ts: str) -> str:
+    """
+    Normalize Eniris timestamps for Python parsing.
+
+    - Converts trailing 'Z' to '+00:00'
+    - Truncates fractional seconds to microseconds (6 digits)
+    """
+    ts = ts.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+
+    match = _FRACTIONAL_SECONDS_RE.search(ts)
+    if not match:
+        return ts
+
+    fraction = match.group(1)
+    normalized = (fraction + "000000")[:6]
+    return ts[: match.start(1)] + normalized + ts[match.end(1) :]
+
+
+def _parse_timestamp_to_utc(ts: Any) -> datetime | None:
+    """Parse an Eniris timestamp to a timezone-aware UTC datetime."""
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(ts / 1000, UTC)
+    if not isinstance(ts, str):
+        return None
+
+    normalized = _normalize_iso8601(ts)
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 class EnirisHacsApiError(Exception):
@@ -46,6 +104,9 @@ class EnirisHacsApiClient:
         """Initialize the API client."""
         self._email = email
         self._password = password
+        # Home Assistant provides a shared ClientSession via async_get_clientsession(hass).
+        # We must never close that shared session. Only close sessions we create ourselves.
+        self._session_owner = session is None
         self._session = session or aiohttp.ClientSession()
         self._refresh_token: str | None = None
         self._access_token: str | None = None
@@ -55,7 +116,7 @@ class EnirisHacsApiClient:
         method: str,
         url: str,
         headers: dict[str, str] | None = None,
-        data: dict[str, Any] | None = None,
+        data: Any | None = None,
         *,
         is_text_response: bool = False,
     ) -> Any:
@@ -66,12 +127,10 @@ class EnirisHacsApiClient:
             return value if len(value) <= limit else f"{value[:limit]}…"
 
         # Intentionally do NOT log headers/body here: it can contain passwords and bearer tokens.
-        _LOGGER.debug("Request: %s %s", method, url)
         try:
             async with self._session.request(
                 method, url, headers=headers, json=data
             ) as response:
-                _LOGGER.debug("Response status: %s for %s", response.status, url)
                 if response.status in (_HTTP_OK, _HTTP_CREATED):
                     if is_text_response:
                         return await response.text()
@@ -89,13 +148,11 @@ class EnirisHacsApiClient:
                     _LOGGER.error(
                         "Authentication error %s for %s", response.status, url
                     )
-                    _LOGGER.debug("Auth error response body: %s", _truncate(body_text))
                     raise EnirisHacsAuthError(
                         f"Authentication failed ({response.status}): {_truncate(body_text)}"
                     )
 
                 _LOGGER.error("API request failed %s for %s", response.status, url)
-                _LOGGER.debug("API error response body: %s", _truncate(body_text))
                 raise EnirisHacsApiError(
                     f"API request failed ({response.status}): {_truncate(body_text)}"
                 )
@@ -115,7 +172,6 @@ class EnirisHacsApiClient:
 
     async def get_refresh_token(self) -> str:
         """Get a refresh token."""
-        _LOGGER.debug("Getting refresh token for %s", self._email)
         payload = {"username": self._email, "password": self._password}
         try:
             response_text = await self._request(
@@ -128,7 +184,6 @@ class EnirisHacsApiClient:
             if response_text:
                 # Clean up the response text - remove any whitespace and quotes
                 self._refresh_token = response_text.strip().strip('"')
-                _LOGGER.debug("Successfully obtained refresh token.")
                 if self._refresh_token is None:
                     raise EnirisHacsAuthError("Refresh token is empty after parsing.")
                 return self._refresh_token
@@ -141,14 +196,12 @@ class EnirisHacsApiClient:
     async def get_access_token(self) -> str:
         """Get an access token using the refresh token."""
         if not self._refresh_token:
-            _LOGGER.debug("No refresh token cached; logging in to obtain one.")
             await self.get_refresh_token()  # This will raise if it fails
 
         if not self._refresh_token:  # Should not happen if above call succeeded
             _LOGGER.error("Refresh token is still missing after attempting to fetch.")
             raise EnirisHacsAuthError("Refresh token is missing.")
 
-        _LOGGER.debug("Getting access token using refresh token.")
         headers = {"Authorization": f"Bearer {self._refresh_token}"}
         try:
             response_data = await self._request(
@@ -157,14 +210,12 @@ class EnirisHacsApiClient:
             if isinstance(response_data, str):
                 # Handle plain text response
                 self._access_token = response_data.strip().strip('"')
-                _LOGGER.debug("Successfully obtained access token.")
                 if not self._access_token:
                     raise EnirisHacsAuthError("Access token is empty after parsing.")
                 return self._access_token
             if isinstance(response_data, dict) and "accessToken" in response_data:
                 # Handle JSON response
                 self._access_token = response_data["accessToken"]
-                _LOGGER.debug("Successfully obtained access token (JSON response).")
                 if not self._access_token:
                     raise EnirisHacsAuthError("Access token is empty after parsing.")
             _LOGGER.error(
@@ -185,7 +236,6 @@ class EnirisHacsApiClient:
     async def ensure_access_token(self) -> str:
         """Ensure a valid access token is available, refreshing if necessary."""
         if not self._access_token:
-            _LOGGER.debug("Access token missing; obtaining a new one.")
             await self.get_access_token()
 
         if not self._access_token:
@@ -197,7 +247,6 @@ class EnirisHacsApiClient:
         """Get a list of devices."""
         access_token = await self.ensure_access_token()
         headers = {"Authorization": f"Bearer {access_token}"}
-        _LOGGER.debug("Fetching devices from Eniris API.")
         try:
             response_data = await self._request("GET", DEVICES_URL, headers=headers)
             if (
@@ -206,11 +255,10 @@ class EnirisHacsApiClient:
                 and isinstance(response_data["device"], list)
             ):
                 devices = response_data["device"]
-                _LOGGER.debug("Fetched %s devices.", len(devices))
                 return devices
             _LOGGER.warning(
-                "No 'device' list found in API response or response is not as expected. Response: %s",
-                response_data,
+                "No 'device' list found in API response or response is not as expected. Response summary: %s",
+                _summarize_for_log(response_data),
             )
             return []  # Return empty list if structure is not as expected
         except EnirisHacsApiError as e:
@@ -218,9 +266,6 @@ class EnirisHacsApiClient:
             # If it's an auth error, it might mean the access token expired mid-flight.
             # A more robust system might retry getting an access token once.
             if isinstance(e, EnirisHacsAuthError):
-                _LOGGER.debug(
-                    "Auth error during device fetch; retrying once with a new access token."
-                )
                 self._access_token = None  # Clear current access token to force refresh
                 access_token = await self.ensure_access_token()  # Retry getting token
                 headers = {"Authorization": f"Bearer {access_token}"}
@@ -238,7 +283,7 @@ class EnirisHacsApiClient:
                     return devices
                 _LOGGER.error(
                     "Still failed to fetch devices after token refresh: %s",
-                    response_data,
+                    _summarize_for_log(response_data),
                 )
                 return []
             raise  # Re-raise original error if not auth or if retry failed
@@ -301,36 +346,11 @@ class EnirisHacsApiClient:
                         ],
                         "tags": {"nodeId": node_id},
                     },
-                    "limit": 1,
-                    "orderBy": "DESC",
-                }
-            )
-
-            # Query for the sum in the time range
-            queries.append(
-                {
-                    "select": [{"field": field, "function": "sum"}],
-                    "from": {
-                        "namespace": {
-                            "version": "1",
-                            "database": "beauvent",
-                            "retentionPolicy": rp,
-                        },
-                        "measurement": measurement,
-                    },
-                    "where": {
-                        "time": [
-                            {
-                                "operator": ">=",
-                                "value": int(start_time.timestamp() * 1000),
-                            },
-                            {
-                                "operator": "<",
-                                "value": int(end_time.timestamp() * 1000),
-                            },
-                        ],
-                        "tags": {"nodeId": node_id},
-                    },
+                    # Fetch raw values for the time window and compute latest client-side.
+                    # This avoids server-side sum() errors on non-numeric fields which can
+                    # abort subsequent statements.
+                    "orderBy": "ASC",
+                    "limit": 10000,
                 }
             )
 
@@ -352,110 +372,69 @@ class EnirisHacsApiClient:
             )
 
             if not queries:  # No valid RPs or fields to query
-                _LOGGER.debug(
-                    "No queries generated for telemetry fetch for node %s, RPs: %s, fields: %s",
-                    node_id,
-                    rp,
-                    fields,
-                )
                 return {}
 
-            # Each field has two queries (latest, sum).
-            num_fields = len(fields)
+            # Each field has one query (raw values); we compute latest locally.
             for field_idx, field in enumerate(fields):
-                base_idx = field_idx * 2
-                latest_stmt = response[base_idx] if base_idx < len(response) else None
-                sum_stmt = (
-                    response[base_idx + 1] if base_idx + 1 < len(response) else None
-                )
+                stmt = response[field_idx] if field_idx < len(response) else None
 
                 if field not in result:
                     result[field] = {}
 
+                if not stmt or not isinstance(stmt, dict) or not stmt.get("series"):
+                    continue
+
                 # Process latest value
-                if latest_stmt and latest_stmt.get("series"):
-                    for series in latest_stmt["series"]:
-                        if not series.get("values"):
-                            continue
-                        latest_value_data = series["values"][-1]
+                for series in stmt["series"]:
+                    values = series.get("values")
+                    if not values:
+                        continue
+
+                    columns = series.get("columns", [])
+                    if field not in columns:
+                        continue
+                    field_col_idx = columns.index(field)
+
+                    # Latest
+                    latest_value_data = values[-1]
+                    if (
+                        isinstance(latest_value_data, list)
+                        and len(latest_value_data) > field_col_idx
+                    ):
                         timestamp = latest_value_data[0]
-                        columns = series.get("columns", [])
-                        for val_idx, value in enumerate(latest_value_data[1:], 1):
-                            if val_idx < len(columns) and columns[val_idx] == field:
-                                result[field][f"{rp}_latest"] = value
+                        result[field][f"{rp}_latest"] = latest_value_data[field_col_idx]
 
-                                if latest_timestamp is None or (
-                                    isinstance(timestamp, (int, float))
-                                    and isinstance(latest_timestamp, (int, float))
-                                    and timestamp > latest_timestamp
-                                ):
-                                    latest_timestamp = timestamp
-                                elif isinstance(timestamp, str) and isinstance(
-                                    latest_timestamp, str
-                                ):
-                                    try:
-                                        dt_timestamp = datetime.fromisoformat(
-                                            timestamp.rstrip("Z")
-                                        )
-                                        dt_latest_timestamp = datetime.fromisoformat(
-                                            latest_timestamp.rstrip("Z")
-                                        )
-                                        if dt_timestamp > dt_latest_timestamp:
-                                            latest_timestamp = timestamp
-                                    except ValueError:
-                                        pass
-
-                # Process sum value
-                if sum_stmt and sum_stmt.get("series"):
-                    for series in sum_stmt["series"]:
-                        if not series.get("values"):
-                            continue
-                        sum_value_data = series["values"][-1]
-                        columns = series.get("columns", [])
-                        for val_idx, value in enumerate(sum_value_data[1:], 1):
-                            if val_idx < len(columns):
-                                col_name = columns[val_idx]
-                                if (
-                                    col_name.startswith("sum_")
-                                    and col_name[4:] == field
-                                ):
-                                    result[field][f"{rp}_sum"] = value
+                        if latest_timestamp is None or (
+                            isinstance(timestamp, (int, float))
+                            and isinstance(latest_timestamp, (int, float))
+                            and timestamp > latest_timestamp
+                        ):
+                            latest_timestamp = timestamp
+                        elif isinstance(timestamp, str) and isinstance(
+                            latest_timestamp, str
+                        ):
+                            try:
+                                dt_timestamp = _parse_timestamp_to_utc(timestamp)
+                                dt_latest_timestamp = _parse_timestamp_to_utc(
+                                    latest_timestamp
+                                )
+                                if dt_timestamp and dt_latest_timestamp:
+                                    if dt_timestamp > dt_latest_timestamp:
+                                        latest_timestamp = timestamp
+                            except Exception:
+                                pass
 
             # Add the overall latest timestamp in UTC
             if latest_timestamp:
-                # Handle both integer (Unix ms) and ISO8601 string
-                if isinstance(latest_timestamp, (int, float)):
-                    result["timestamp"] = datetime.fromtimestamp(
-                        latest_timestamp / 1000, UTC
+                dt_obj = _parse_timestamp_to_utc(latest_timestamp)
+                if dt_obj:
+                    result["timestamp"] = dt_obj
+                else:
+                    _LOGGER.warning(
+                        "Could not parse timestamp string: %s",
+                        latest_timestamp,
                     )
-                elif isinstance(latest_timestamp, str):
-                    # Attempt to parse various ISO 8601 formats, including those with 'Z'
-                    ts_str = latest_timestamp.rstrip("Z")
-                    if "." in ts_str:  # Check if fractional seconds are present
-                        try:
-                            dt_obj = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S.%f")
-                        except ValueError:
-                            try:  # Fallback for non-fractional
-                                dt_obj = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
-                            except ValueError:
-                                _LOGGER.warning(
-                                    "Could not parse timestamp string: %s",
-                                    latest_timestamp,
-                                )
-                                dt_obj = None
-                    else:
-                        try:
-                            dt_obj = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
-                        except ValueError:
-                            _LOGGER.warning(
-                                "Could not parse timestamp string: %s", latest_timestamp
-                            )
-                            dt_obj = None
 
-                    if dt_obj:
-                        result["timestamp"] = dt_obj.replace(tzinfo=UTC)
-
-            _LOGGER.debug("Telemetry data for device %s: %s", node_id, result)
             return result
 
         except EnirisHacsApiError as e:
@@ -494,13 +473,9 @@ class EnirisHacsApiClient:
                             return {}
 
                         for field_idx, field in enumerate(fields):
-                            base_idx = field_idx * 2
-                            latest_stmt = (
-                                response[base_idx] if base_idx < len(response) else None
-                            )
-                            sum_stmt = (
-                                response[base_idx + 1]
-                                if base_idx + 1 < len(response)
+                            stmt = (
+                                response[field_idx]
+                                if field_idx < len(response)
                                 else None
                             )
 
@@ -508,105 +483,65 @@ class EnirisHacsApiClient:
                                 result[field] = {}
 
                             # Process latest value
-                            if latest_stmt and latest_stmt.get("series"):
-                                for series_data in latest_stmt["series"]:
-                                    if not series_data.get("values"):
-                                        continue
-                                    latest_value_data = series_data["values"][-1]
-                                    timestamp = latest_value_data[0]
-                                    columns = series_data.get("columns", [])
-                                    for val_idx, value in enumerate(
-                                        latest_value_data[1:], 1
-                                    ):
-                                        if (
-                                            val_idx < len(columns)
-                                            and columns[val_idx] == field
-                                        ):
-                                            result[field][f"{rp}_latest"] = value
-                                            if latest_timestamp is None or (
-                                                isinstance(timestamp, (int, float))
-                                                and isinstance(
-                                                    latest_timestamp, (int, float)
-                                                )
-                                                and timestamp > latest_timestamp
-                                            ):
-                                                latest_timestamp = timestamp
-                                            elif isinstance(
-                                                timestamp, str
-                                            ) and isinstance(latest_timestamp, str):
-                                                try:
-                                                    dt_timestamp = (
-                                                        datetime.fromisoformat(
-                                                            timestamp.rstrip("Z")
-                                                        )
-                                                    )
-                                                    dt_latest_timestamp = (
-                                                        datetime.fromisoformat(
-                                                            latest_timestamp.rstrip("Z")
-                                                        )
-                                                    )
-                                                    if (
-                                                        dt_timestamp
-                                                        > dt_latest_timestamp
-                                                    ):
-                                                        latest_timestamp = timestamp
-                                                except ValueError:
-                                                    pass
+                            if (
+                                not stmt
+                                or not isinstance(stmt, dict)
+                                or not stmt.get("series")
+                            ):
+                                continue
 
-                            # Process sum value
-                            if sum_stmt and sum_stmt.get("series"):
-                                for series_data in sum_stmt["series"]:
-                                    if not series_data.get("values"):
-                                        continue
-                                    sum_value_data = series_data["values"][-1]
-                                    columns = series_data.get("columns", [])
-                                    for val_idx, value in enumerate(
-                                        sum_value_data[1:], 1
+                            for series_data in stmt["series"]:
+                                values = series_data.get("values")
+                                if not values:
+                                    continue
+
+                                columns = series_data.get("columns", [])
+                                if field not in columns:
+                                    continue
+                                field_col_idx = columns.index(field)
+
+                                latest_value_data = values[-1]
+                                if (
+                                    isinstance(latest_value_data, list)
+                                    and len(latest_value_data) > field_col_idx
+                                ):
+                                    timestamp = latest_value_data[0]
+                                    result[field][f"{rp}_latest"] = latest_value_data[
+                                        field_col_idx
+                                    ]
+                                    if latest_timestamp is None or (
+                                        isinstance(timestamp, (int, float))
+                                        and isinstance(latest_timestamp, (int, float))
+                                        and timestamp > latest_timestamp
                                     ):
-                                        if val_idx < len(columns):
-                                            col_name = columns[val_idx]
-                                            if (
-                                                col_name.startswith("sum_")
-                                                and col_name[4:] == field
-                                            ):
-                                                result[field][f"{rp}_sum"] = value
-                        if latest_timestamp:
-                            # Handle both integer (Unix ms) and ISO8601 string
-                            if isinstance(latest_timestamp, (int, float)):
-                                result["timestamp"] = datetime.fromtimestamp(
-                                    latest_timestamp / 1000, UTC
-                                )
-                            elif isinstance(latest_timestamp, str):
-                                ts_str = latest_timestamp.rstrip("Z")
-                                if "." in ts_str:
-                                    try:
-                                        dt_obj = datetime.strptime(
-                                            ts_str, "%Y-%m-%dT%H:%M:%S.%f"
-                                        )
-                                    except ValueError:
+                                        latest_timestamp = timestamp
+                                    elif isinstance(timestamp, str) and isinstance(
+                                        latest_timestamp, str
+                                    ):
                                         try:
-                                            dt_obj = datetime.strptime(
-                                                ts_str, "%Y-%m-%dT%H:%M:%S"
+                                            dt_timestamp = _parse_timestamp_to_utc(
+                                                timestamp
                                             )
-                                        except ValueError:
-                                            _LOGGER.warning(
-                                                "Could not parse timestamp string on retry: %s",
-                                                latest_timestamp,
+                                            dt_latest_timestamp = (
+                                                _parse_timestamp_to_utc(
+                                                    latest_timestamp
+                                                )
                                             )
-                                            dt_obj = None
-                                else:
-                                    try:
-                                        dt_obj = datetime.strptime(
-                                            ts_str, "%Y-%m-%dT%H:%M:%S"
-                                        )
-                                    except ValueError:
-                                        _LOGGER.warning(
-                                            "Could not parse timestamp string on retry: %s",
-                                            latest_timestamp,
-                                        )
-                                        dt_obj = None
-                                if dt_obj:
-                                    result["timestamp"] = dt_obj.replace(tzinfo=UTC)
+                                            if dt_timestamp and dt_latest_timestamp:
+                                                if dt_timestamp > dt_latest_timestamp:
+                                                    latest_timestamp = timestamp
+                                        except Exception:
+                                            pass
+
+                        if latest_timestamp:
+                            dt_obj = _parse_timestamp_to_utc(latest_timestamp)
+                            if dt_obj:
+                                result["timestamp"] = dt_obj
+                            else:
+                                _LOGGER.warning(
+                                    "Could not parse timestamp string on retry: %s",
+                                    latest_timestamp,
+                                )
                         return result
                 except Exception as retry_error:
                     _LOGGER.error(
@@ -630,18 +565,11 @@ class EnirisHacsApiClient:
 
         series_configs = properties.get("nodeInfluxSeries", [])
         if not series_configs:
-            _LOGGER.debug("No nodeInfluxSeries configuration for device %s.", node_id)
             return device_data  # Return original data
 
         # Ensure _latest_data exists, even if empty, to allow merging.
         if "_latest_data" not in device_data:
             device_data["_latest_data"] = {}
-
-        _LOGGER.debug(
-            "Fetching telemetry (RP=%s) for device %s",
-            self._SUPPORTED_RETENTION_POLICY,
-            node_id,
-        )
 
         something_fetched = False
         for series_config in series_configs:
@@ -669,9 +597,20 @@ class EnirisHacsApiClient:
                     if field not in device_data["_latest_data"]:
                         device_data["_latest_data"][field] = {}
                     if isinstance(rp_values, dict):
+                        # Sum values are no longer produced; remove any stale *_sum keys.
+                        if isinstance(device_data["_latest_data"].get(field), dict):
+                            for existing_key in list(
+                                device_data["_latest_data"][field].keys()
+                            ):
+                                if isinstance(
+                                    existing_key, str
+                                ) and existing_key.endswith("_sum"):
+                                    device_data["_latest_data"][field].pop(
+                                        existing_key, None
+                                    )
                         device_data["_latest_data"][field].update(
                             rp_values
-                        )  # Merge rp_one_m_latest, rp_one_m_sum etc.
+                        )  # Merge rp_one_m_latest etc.
                     else:
                         # This case should ideally not happen if get_device_telemetry returns the new structure
                         # but as a fallback, if a direct value is under field (e.g. old data struct or simple value)
@@ -689,20 +628,6 @@ class EnirisHacsApiClient:
                             timestamp_from_new_data
                         )
 
-        if something_fetched:
-            _LOGGER.debug(
-                "Updated _latest_data for %s after fetching %s: %s",
-                node_id,
-                self._SUPPORTED_RETENTION_POLICY,
-                device_data["_latest_data"],
-            )
-        else:
-            _LOGGER.debug(
-                "No new telemetry data was fetched for %s with RP %s.",
-                node_id,
-                self._SUPPORTED_RETENTION_POLICY,
-            )
-
         return device_data  # Return the modified device_data
 
     async def get_processed_devices(self) -> dict[str, dict[str, Any]]:
@@ -711,8 +636,6 @@ class EnirisHacsApiClient:
         if not raw_devices:
             _LOGGER.error("No devices returned from API")
             return {}
-
-        _LOGGER.debug("Raw devices from API: %s", raw_devices)
         # Use a class member or persistent store if you need to maintain device_data across calls
         # For now, we rebuild devices_by_node_id each time, but merge telemetry into it.
         # If get_processed_devices is the main entry point for the coordinator update,
@@ -730,10 +653,6 @@ class EnirisHacsApiClient:
             properties = device_data_from_api.get("properties", {})
             node_id = properties.get("nodeId")
             if not node_id:
-                _LOGGER.warning(
-                    "Device data from API missing 'nodeId': %s",
-                    device_data_from_api.get("id"),
-                )
                 continue
             # Initialize with new structural data.
             temp_devices_by_node_id[node_id] = {
@@ -746,18 +665,8 @@ class EnirisHacsApiClient:
         for node_id, current_device_struct in temp_devices_by_node_id.items():
             properties = current_device_struct.get("properties", {})
             node_type = properties.get("nodeType")
-            _LOGGER.debug(
-                "Processing device %s of type %s for telemetry update strategy",
-                node_id,
-                node_type,
-            )
 
             if node_type not in SUPPORTED_NODE_TYPES:
-                _LOGGER.debug(
-                    "Skipping unsupported device type %s for device %s",
-                    node_type,
-                    node_id,
-                )
                 continue
 
             # Populate children for this device (structural)
@@ -782,11 +691,6 @@ class EnirisHacsApiClient:
 
             if is_primary:
                 try:
-                    _LOGGER.debug(
-                        "Primary device %s: fetching telemetry (RP=%s)",
-                        node_id,
-                        self._SUPPORTED_RETENTION_POLICY,
-                    )
                     # Fetch and merge into current_device_struct["_latest_data"].
                     await self.get_device_latest_data(current_device_struct)
 
@@ -799,13 +703,6 @@ class EnirisHacsApiClient:
                         )
                         if not child_node_id:
                             continue
-
-                        _LOGGER.debug(
-                            "Child device %s of %s: fetching telemetry (RP=%s)",
-                            child_node_id,
-                            node_id,
-                            self._SUPPORTED_RETENTION_POLICY,
-                        )
                         # Merge into child_device_struct["_latest_data"].
                         await self.get_device_latest_data(child_device_struct)
 
@@ -819,7 +716,7 @@ class EnirisHacsApiClient:
                         current_device_struct
                     )
 
-                except Exception as e:
+                except Exception:
                     _LOGGER.exception(
                         "Error processing device %s for telemetry", node_id
                     )
@@ -832,4 +729,5 @@ class EnirisHacsApiClient:
 
     async def close(self) -> None:
         """Close the client session."""
-        await self._session.close()
+        if self._session_owner and not self._session.closed:
+            await self._session.close()
