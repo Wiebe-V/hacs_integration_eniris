@@ -4,4 +4,9 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-python3 -m pip install --upgrade --requirement requirements.txt
+if [[ ! -d "${PWD}/.venv" ]]; then
+	/usr/local/bin/python -m venv "${PWD}/.venv"
+fi
+
+"${PWD}/.venv/bin/python" -m pip install --upgrade pip
+"${PWD}/.venv/bin/python" -m pip install --upgrade --requirement requirements.txt

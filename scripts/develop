@@ -4,6 +4,12 @@ set -e
 
 cd "$(dirname "$0")/.."
 
+HASS_BIN="${PWD}/.venv/bin/hass"
+if [[ ! -x "$HASS_BIN" ]]; then
+    echo "ERROR: $HASS_BIN not found. Run ./scripts/setup first." >&2
+    exit 1
+fi
+
 CONFIG_DIR="${PWD}/config/dev"
 
 mkdir -p "$CONFIG_DIR"
@@ -19,6 +25,12 @@ homeassistant:
 api:
 frontend:
 http:
+
+# Avoid frontend websocket errors for common panels
+sensor:
+recorder:
+history:
+logbook:
 
 automation:
 script:
@@ -38,4 +50,4 @@ fi
 export PYTHONPATH="${PYTHONPATH}:${PWD}/custom_components"
 
 # Start Home Assistant
-hass --config "$CONFIG_DIR" --debug
+"$HASS_BIN" --config "$CONFIG_DIR" --debug
