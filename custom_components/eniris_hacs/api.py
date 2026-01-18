@@ -1,6 +1,5 @@
 """API client for Eniris HACS."""
 
-import asyncio
 import copy
 import logging
 from datetime import UTC, datetime, timedelta
@@ -20,6 +19,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# HTTP status codes
+_HTTP_OK = 200
+_HTTP_CREATED = 201
+
 
 class EnirisHacsApiError(Exception):
     """Custom exception for API errors."""
@@ -32,8 +35,7 @@ class EnirisHacsAuthError(EnirisHacsApiError):
 class EnirisHacsApiClient:
     """API Client for Eniris HACS."""
 
-    _RP_ONE_M_UPDATE_INTERVAL = timedelta(seconds=60)  # Interval for rp_one_m updates
-    _DEFAULT_RETENTION_POLICIES = ["rp_one_m", "rp_one_s"]  # All supported RPs
+    _SUPPORTED_RETENTION_POLICY = "rp_one_m"
 
     def __init__(
         self,
@@ -47,9 +49,6 @@ class EnirisHacsApiClient:
         self._session = session or aiohttp.ClientSession()
         self._refresh_token: str | None = None
         self._access_token: str | None = None
-        self._rp_one_m_last_update_times: dict[
-            str, datetime
-        ] = {}  # node_id -> last rp_one_m update time
 
     async def _request(
         self,
@@ -57,6 +56,7 @@ class EnirisHacsApiClient:
         url: str,
         headers: dict[str, str] | None = None,
         data: dict[str, Any] | None = None,
+        *,
         is_text_response: bool = False,
     ) -> Any:
         """Make an API request."""
@@ -72,12 +72,12 @@ class EnirisHacsApiClient:
                 method, url, headers=headers, json=data
             ) as response:
                 _LOGGER.debug("Response status: %s for %s", response.status, url)
-                if response.status == 200 or response.status == 201:
+                if response.status in (_HTTP_OK, _HTTP_CREATED):
                     if is_text_response:
                         return await response.text()
                     try:
                         return await response.json()
-                    except Exception as e:
+                    except ValueError as e:
                         _LOGGER.warning(
                             "Failed to parse JSON response: %s. Falling back to text response.",
                             e,
@@ -129,6 +129,8 @@ class EnirisHacsApiClient:
                 # Clean up the response text - remove any whitespace and quotes
                 self._refresh_token = response_text.strip().strip('"')
                 _LOGGER.debug("Successfully obtained refresh token.")
+                if self._refresh_token is None:
+                    raise EnirisHacsAuthError("Refresh token is empty after parsing.")
                 return self._refresh_token
             _LOGGER.error("Failed to get refresh token: Empty response.")
             raise EnirisHacsAuthError("Failed to get refresh token: Empty response")
@@ -156,12 +158,15 @@ class EnirisHacsApiClient:
                 # Handle plain text response
                 self._access_token = response_data.strip().strip('"')
                 _LOGGER.debug("Successfully obtained access token.")
+                if not self._access_token:
+                    raise EnirisHacsAuthError("Access token is empty after parsing.")
                 return self._access_token
             if isinstance(response_data, dict) and "accessToken" in response_data:
                 # Handle JSON response
                 self._access_token = response_data["accessToken"]
                 _LOGGER.debug("Successfully obtained access token (JSON response).")
-                return self._access_token
+                if not self._access_token:
+                    raise EnirisHacsAuthError("Access token is empty after parsing.")
             _LOGGER.error(
                 "Failed to get access token: Invalid response format. Response: %s",
                 response_data,
@@ -243,88 +248,91 @@ class EnirisHacsApiClient:
         node_id: str,
         measurement: str,
         fields: list[str],
-        retention_policies_to_fetch: list[str],
+        retention_policy: str | None = None,
     ) -> dict[str, Any]:
-        """Get telemetry data for a specific device for specified retention policies."""
+        """
+        Get telemetry data for a specific device.
+
+        Only the retention policy `rp_one_m` is supported.
+        """
         access_token = await self.ensure_access_token()
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
 
+        rp = retention_policy or self._SUPPORTED_RETENTION_POLICY
+        if rp != self._SUPPORTED_RETENTION_POLICY:
+            _LOGGER.warning(
+                "Unsupported retention policy %s requested for node %s; forcing %s.",
+                rp,
+                node_id,
+                self._SUPPORTED_RETENTION_POLICY,
+            )
+            rp = self._SUPPORTED_RETENTION_POLICY
+
         # Get the last 5 minutes of data
         end_time = datetime.now(UTC)
         start_time = end_time - timedelta(minutes=5)
 
-        queries = []
-        # Only iterate over the policies we want to fetch for this call
-        for rp in retention_policies_to_fetch:
-            if (
-                rp not in self._DEFAULT_RETENTION_POLICIES
-            ):  # Validate against known policies
-                _LOGGER.warning(
-                    "Requested to fetch unknown retention policy %s for node %s. Skipping.",
-                    rp,
-                    node_id,
-                )
-                continue
-            for field in fields:
-                queries.append(
-                    {
-                        "select": [field],
-                        "from": {
-                            "namespace": {
-                                "version": "1",
-                                "database": "beauvent",
-                                "retentionPolicy": rp,
+        queries: list[dict[str, Any]] = []
+        for field in fields:
+            queries.append(
+                {
+                    "select": [field],
+                    "from": {
+                        "namespace": {
+                            "version": "1",
+                            "database": "beauvent",
+                            "retentionPolicy": rp,
+                        },
+                        "measurement": measurement,
+                    },
+                    "where": {
+                        "time": [
+                            {
+                                "operator": ">=",
+                                "value": int(start_time.timestamp() * 1000),
                             },
-                            "measurement": measurement,
-                        },
-                        "where": {
-                            "time": [
-                                {
-                                    "operator": ">=",
-                                    "value": int(start_time.timestamp() * 1000),
-                                },
-                                {
-                                    "operator": "<",
-                                    "value": int(end_time.timestamp() * 1000),
-                                },
-                            ],
-                            "tags": {"nodeId": node_id},
-                        },
-                        "limit": 1,
-                        "orderBy": "DESC",
-                    }
-                )
+                            {
+                                "operator": "<",
+                                "value": int(end_time.timestamp() * 1000),
+                            },
+                        ],
+                        "tags": {"nodeId": node_id},
+                    },
+                    "limit": 1,
+                    "orderBy": "DESC",
+                }
+            )
 
-                # Query for the sum in the time range
-                queries.append(
-                    {
-                        "select": [{"field": field, "function": "sum"}],
-                        "from": {
-                            "namespace": {
-                                "version": "1",
-                                "database": "beauvent",
-                                "retentionPolicy": rp,
+            # Query for the sum in the time range
+            queries.append(
+                {
+                    "select": [{"field": field, "function": "sum"}],
+                    "from": {
+                        "namespace": {
+                            "version": "1",
+                            "database": "beauvent",
+                            "retentionPolicy": rp,
+                        },
+                        "measurement": measurement,
+                    },
+                    "where": {
+                        "time": [
+                            {
+                                "operator": ">=",
+                                "value": int(start_time.timestamp() * 1000),
                             },
-                            "measurement": measurement,
-                        },
-                        "where": {
-                            "time": [
-                                {
-                                    "operator": ">=",
-                                    "value": int(start_time.timestamp() * 1000),
-                                },
-                                {
-                                    "operator": "<",
-                                    "value": int(end_time.timestamp() * 1000),
-                                },
-                            ],
-                            "tags": {"nodeId": node_id},
-                        },
-                    }
-                )
+                            {
+                                "operator": "<",
+                                "value": int(end_time.timestamp() * 1000),
+                            },
+                        ],
+                        "tags": {"nodeId": node_id},
+                    },
+                }
+            )
 
         try:
             response = await self._request(
@@ -343,111 +351,75 @@ class EnirisHacsApiClient:
                 None  # We'll store the latest timestamp across all series
             )
 
-            # Each field has two queries (latest, sum) per retention policy.
-            # The number of fields is len(fields)
-            # The number of retention policies to fetch *in this call* is len(retention_policies_to_fetch)
-
-            num_fields = len(fields)
-            # Adjust for potentially filtered list of RPs being fetched
-            active_rps_in_response_order = [
-                rp
-                for rp in retention_policies_to_fetch
-                if rp in self._DEFAULT_RETENTION_POLICIES
-            ]
-            num_active_rps = len(active_rps_in_response_order)
-
             if not queries:  # No valid RPs or fields to query
                 _LOGGER.debug(
                     "No queries generated for telemetry fetch for node %s, RPs: %s, fields: %s",
                     node_id,
-                    retention_policies_to_fetch,
+                    rp,
                     fields,
                 )
                 return {}
 
-            # The response will only contain data for the RPs that were actually queried.
-            # We need to map the response index based on active_rps_in_response_order.
-            for rp_idx, rp in enumerate(active_rps_in_response_order):
-                for field_idx, field in enumerate(fields):
-                    base_idx = (rp_idx * num_fields * 2) + (field_idx * 2)
+            # Each field has two queries (latest, sum).
+            num_fields = len(fields)
+            for field_idx, field in enumerate(fields):
+                base_idx = field_idx * 2
+                latest_stmt = response[base_idx] if base_idx < len(response) else None
+                sum_stmt = (
+                    response[base_idx + 1] if base_idx + 1 < len(response) else None
+                )
 
-                    latest_stmt = (
-                        response[base_idx] if base_idx < len(response) else None
-                    )
-                    sum_stmt = (
-                        response[base_idx + 1] if base_idx + 1 < len(response) else None
-                    )
+                if field not in result:
+                    result[field] = {}
 
-                    # Create keys like "field_rp_one_m_latest", "field_rp_one_s_sum"
-                    # And for backward compatibility / general data, store under field name as dict
-                    if field not in result:
-                        result[field] = {}
+                # Process latest value
+                if latest_stmt and latest_stmt.get("series"):
+                    for series in latest_stmt["series"]:
+                        if not series.get("values"):
+                            continue
+                        latest_value_data = series["values"][-1]
+                        timestamp = latest_value_data[0]
+                        columns = series.get("columns", [])
+                        for val_idx, value in enumerate(latest_value_data[1:], 1):
+                            if val_idx < len(columns) and columns[val_idx] == field:
+                                result[field][f"{rp}_latest"] = value
 
-                    # Process latest value for current rp and field
-                    if latest_stmt and latest_stmt.get("series"):
-                        for series in latest_stmt["series"]:
-                            if not series.get("values"):
-                                continue
-                            latest_value_data = series["values"][
-                                -1
-                            ]  # list: [timestamp, val1, val2,...]
-                            timestamp = latest_value_data[0]
-                            columns = series.get(
-                                "columns", []
-                            )  # First column is always 'time'
-                            for val_idx, value in enumerate(latest_value_data[1:], 1):
-                                if val_idx < len(columns):
-                                    col_name = columns[val_idx]
-                                    if (
-                                        col_name == field
-                                    ):  # Make sure we are processing the correct field
-                                        result[field][f"{rp}_latest"] = value
-                                        # Update the overall latest_timestamp if this one is newer
-                                        if latest_timestamp is None or (
-                                            isinstance(timestamp, (int, float))
-                                            and isinstance(
-                                                latest_timestamp, (int, float)
-                                            )
-                                            and timestamp > latest_timestamp
-                                        ):
+                                if latest_timestamp is None or (
+                                    isinstance(timestamp, (int, float))
+                                    and isinstance(latest_timestamp, (int, float))
+                                    and timestamp > latest_timestamp
+                                ):
+                                    latest_timestamp = timestamp
+                                elif isinstance(timestamp, str) and isinstance(
+                                    latest_timestamp, str
+                                ):
+                                    try:
+                                        dt_timestamp = datetime.fromisoformat(
+                                            timestamp.rstrip("Z")
+                                        )
+                                        dt_latest_timestamp = datetime.fromisoformat(
+                                            latest_timestamp.rstrip("Z")
+                                        )
+                                        if dt_timestamp > dt_latest_timestamp:
                                             latest_timestamp = timestamp
-                                        elif isinstance(timestamp, str) and isinstance(
-                                            latest_timestamp, str
-                                        ):  # Assuming ISO strings if not numbers
-                                            try:
-                                                dt_timestamp = datetime.fromisoformat(
-                                                    timestamp.rstrip("Z")
-                                                )
-                                                dt_latest_timestamp = (
-                                                    datetime.fromisoformat(
-                                                        latest_timestamp.rstrip("Z")
-                                                    )
-                                                )
-                                                if dt_timestamp > dt_latest_timestamp:
-                                                    latest_timestamp = timestamp
-                                            except ValueError:  # Handle cases where parsing might fail or types are mixed unexpectedly
-                                                pass  # Keep existing latest_timestamp
+                                    except ValueError:
+                                        pass
 
-                    # Process sum value for current rp and field
-                    if sum_stmt and sum_stmt.get("series"):
-                        for series in sum_stmt["series"]:
-                            if not series.get("values"):
-                                continue
-                            sum_value_data = series["values"][
-                                -1
-                            ]  # list: [timestamp, sum_val1, sum_val2,...]
-                            columns = series.get(
-                                "columns", []
-                            )  # First column is 'time'
-                            for val_idx, value in enumerate(sum_value_data[1:], 1):
-                                if val_idx < len(columns):
-                                    col_name = columns[val_idx]  # e.g., "sum_field"
-                                    # Ensure we match the correct summed field, strip "sum_" prefix
-                                    if (
-                                        col_name.startswith("sum_")
-                                        and col_name[4:] == field
-                                    ):
-                                        result[field][f"{rp}_sum"] = value
+                # Process sum value
+                if sum_stmt and sum_stmt.get("series"):
+                    for series in sum_stmt["series"]:
+                        if not series.get("values"):
+                            continue
+                        sum_value_data = series["values"][-1]
+                        columns = series.get("columns", [])
+                        for val_idx, value in enumerate(sum_value_data[1:], 1):
+                            if val_idx < len(columns):
+                                col_name = columns[val_idx]
+                                if (
+                                    col_name.startswith("sum_")
+                                    and col_name[4:] == field
+                                ):
+                                    result[field][f"{rp}_sum"] = value
 
             # Add the overall latest timestamp in UTC
             if latest_timestamp:
@@ -516,110 +488,88 @@ class EnirisHacsApiClient:
                         # Process the response as before, adapted for new structure
                         result = {}
                         latest_timestamp = None
-                        num_fields = len(fields)
-                        # Adjust for potentially filtered list of RPs being fetched in retry
-                        active_rps_in_response_order_retry = [
-                            rp
-                            for rp in retention_policies_to_fetch
-                            if rp in self._DEFAULT_RETENTION_POLICIES
-                        ]
-                        num_active_rps_retry = len(active_rps_in_response_order_retry)
-
                         if (
                             not queries
                         ):  # No queries means no response processing needed
                             return {}
 
-                        for rp_idx, rp in enumerate(active_rps_in_response_order_retry):
-                            for field_idx, field in enumerate(fields):
-                                base_idx = (rp_idx * num_fields * 2) + (field_idx * 2)
-                                latest_stmt = (
-                                    response[base_idx]
-                                    if base_idx < len(response)
-                                    else None
-                                )
-                                sum_stmt = (
-                                    response[base_idx + 1]
-                                    if base_idx + 1 < len(response)
-                                    else None
-                                )
+                        for field_idx, field in enumerate(fields):
+                            base_idx = field_idx * 2
+                            latest_stmt = (
+                                response[base_idx] if base_idx < len(response) else None
+                            )
+                            sum_stmt = (
+                                response[base_idx + 1]
+                                if base_idx + 1 < len(response)
+                                else None
+                            )
 
-                                if field not in result:
-                                    result[field] = {}
+                            if field not in result:
+                                result[field] = {}
 
-                                # Process latest value
-                                if latest_stmt and latest_stmt.get("series"):
-                                    for series_data in latest_stmt["series"]:
-                                        if not series_data.get("values"):
-                                            continue
-                                        latest_value_data = series_data["values"][-1]
-                                        timestamp = latest_value_data[0]
-                                        columns = series_data.get("columns", [])
-                                        for val_idx, value in enumerate(
-                                            latest_value_data[1:], 1
+                            # Process latest value
+                            if latest_stmt and latest_stmt.get("series"):
+                                for series_data in latest_stmt["series"]:
+                                    if not series_data.get("values"):
+                                        continue
+                                    latest_value_data = series_data["values"][-1]
+                                    timestamp = latest_value_data[0]
+                                    columns = series_data.get("columns", [])
+                                    for val_idx, value in enumerate(
+                                        latest_value_data[1:], 1
+                                    ):
+                                        if (
+                                            val_idx < len(columns)
+                                            and columns[val_idx] == field
                                         ):
-                                            if val_idx < len(columns):
-                                                col_name = columns[val_idx]
-                                                if col_name == field:
-                                                    result[field][f"{rp}_latest"] = (
-                                                        value
+                                            result[field][f"{rp}_latest"] = value
+                                            if latest_timestamp is None or (
+                                                isinstance(timestamp, (int, float))
+                                                and isinstance(
+                                                    latest_timestamp, (int, float)
+                                                )
+                                                and timestamp > latest_timestamp
+                                            ):
+                                                latest_timestamp = timestamp
+                                            elif isinstance(
+                                                timestamp, str
+                                            ) and isinstance(latest_timestamp, str):
+                                                try:
+                                                    dt_timestamp = (
+                                                        datetime.fromisoformat(
+                                                            timestamp.rstrip("Z")
+                                                        )
                                                     )
-                                                    if latest_timestamp is None or (
-                                                        isinstance(
-                                                            timestamp, (int, float)
+                                                    dt_latest_timestamp = (
+                                                        datetime.fromisoformat(
+                                                            latest_timestamp.rstrip("Z")
                                                         )
-                                                        and isinstance(
-                                                            latest_timestamp,
-                                                            (int, float),
-                                                        )
-                                                        and timestamp > latest_timestamp
+                                                    )
+                                                    if (
+                                                        dt_timestamp
+                                                        > dt_latest_timestamp
                                                     ):
                                                         latest_timestamp = timestamp
-                                                    elif isinstance(
-                                                        timestamp, str
-                                                    ) and isinstance(
-                                                        latest_timestamp, str
-                                                    ):
-                                                        try:
-                                                            dt_timestamp = (
-                                                                datetime.fromisoformat(
-                                                                    timestamp.rstrip(
-                                                                        "Z"
-                                                                    )
-                                                                )
-                                                            )
-                                                            dt_latest_timestamp = datetime.fromisoformat(
-                                                                latest_timestamp.rstrip(
-                                                                    "Z"
-                                                                )
-                                                            )
-                                                            if (
-                                                                dt_timestamp
-                                                                > dt_latest_timestamp
-                                                            ):
-                                                                latest_timestamp = (
-                                                                    timestamp
-                                                                )
-                                                        except ValueError:
-                                                            pass
+                                                except ValueError:
+                                                    pass
 
-                                # Process sum value
-                                if sum_stmt and sum_stmt.get("series"):
-                                    for series_data in sum_stmt["series"]:
-                                        if not series_data.get("values"):
-                                            continue
-                                        sum_value_data = series_data["values"][-1]
-                                        columns = series_data.get("columns", [])
-                                        for val_idx, value in enumerate(
-                                            sum_value_data[1:], 1
-                                        ):
-                                            if val_idx < len(columns):
-                                                col_name = columns[val_idx]
-                                                if (
-                                                    col_name.startswith("sum_")
-                                                    and col_name[4:] == field
-                                                ):
-                                                    result[field][f"{rp}_sum"] = value
+                            # Process sum value
+                            if sum_stmt and sum_stmt.get("series"):
+                                for series_data in sum_stmt["series"]:
+                                    if not series_data.get("values"):
+                                        continue
+                                    sum_value_data = series_data["values"][-1]
+                                    columns = series_data.get("columns", [])
+                                    for val_idx, value in enumerate(
+                                        sum_value_data[1:], 1
+                                    ):
+                                        if val_idx < len(columns):
+                                            col_name = columns[val_idx]
+                                            if (
+                                                col_name.startswith("sum_")
+                                                and col_name[4:] == field
+                                            ):
+                                                result[field][f"{rp}_sum"] = value
                         if latest_timestamp:
                             # Handle both integer (Unix ms) and ISO8601 string
                             if isinstance(latest_timestamp, (int, float)):
@@ -666,9 +616,9 @@ class EnirisHacsApiClient:
             return {}
 
     async def get_device_latest_data(
-        self, device_data: dict[str, Any], retention_policies_to_fetch: list[str]
+        self, device_data: dict[str, Any]
     ) -> dict[str, Any]:
-        """Get the latest telemetry data for a device for specified RPs and merge it into device_data."""
+        """Get the latest telemetry data for a device and merge it into device_data."""
         properties = device_data.get("properties", {})
         node_id = properties.get("nodeId")
         if not node_id:
@@ -687,15 +637,10 @@ class EnirisHacsApiClient:
         if "_latest_data" not in device_data:
             device_data["_latest_data"] = {}
 
-        if not retention_policies_to_fetch:
-            _LOGGER.debug(
-                "No retention policies specified to fetch for node %s. Returning existing data.",
-                node_id,
-            )
-            return device_data
-
         _LOGGER.debug(
-            "Fetching RPs %s for device %s", retention_policies_to_fetch, node_id
+            "Fetching telemetry (RP=%s) for device %s",
+            self._SUPPORTED_RETENTION_POLICY,
+            node_id,
         )
 
         something_fetched = False
@@ -708,7 +653,10 @@ class EnirisHacsApiClient:
 
             # Get telemetry data for this series, only for the specified RPs
             new_telemetry_data = await self.get_device_telemetry(
-                node_id, measurement, fields, retention_policies_to_fetch
+                node_id,
+                measurement,
+                fields,
+                retention_policy=self._SUPPORTED_RETENTION_POLICY,
             )
 
             if new_telemetry_data:
@@ -723,7 +671,7 @@ class EnirisHacsApiClient:
                     if isinstance(rp_values, dict):
                         device_data["_latest_data"][field].update(
                             rp_values
-                        )  # Merge rp_one_m_latest, rp_one_s_latest etc.
+                        )  # Merge rp_one_m_latest, rp_one_m_sum etc.
                     else:
                         # This case should ideally not happen if get_device_telemetry returns the new structure
                         # but as a fallback, if a direct value is under field (e.g. old data struct or simple value)
@@ -745,14 +693,14 @@ class EnirisHacsApiClient:
             _LOGGER.debug(
                 "Updated _latest_data for %s after fetching %s: %s",
                 node_id,
-                retention_policies_to_fetch,
+                self._SUPPORTED_RETENTION_POLICY,
                 device_data["_latest_data"],
             )
         else:
             _LOGGER.debug(
-                "No new telemetry data was fetched for %s with RPs %s.",
+                "No new telemetry data was fetched for %s with RP %s.",
                 node_id,
-                retention_policies_to_fetch,
+                self._SUPPORTED_RETENTION_POLICY,
             )
 
         return device_data  # Return the modified device_data
@@ -787,7 +735,7 @@ class EnirisHacsApiClient:
                     device_data_from_api.get("id"),
                 )
                 continue
-            # Initialize with new structural data, ensure _latest_data and _processed_children exist
+            # Initialize with new structural data.
             temp_devices_by_node_id[node_id] = {
                 **device_data_from_api,
                 "_latest_data": {},
@@ -834,31 +782,13 @@ class EnirisHacsApiClient:
 
             if is_primary:
                 try:
-                    # This is where we decide which RPs to fetch for the primary device
-                    rps_to_fetch_for_primary: list[str] = [
-                        "rp_one_s"
-                    ]  # Always fetch rp_one_s
-                    last_rp_m_update = self._rp_one_m_last_update_times.get(node_id)
-                    if (
-                        not last_rp_m_update
-                        or (current_time - last_rp_m_update)
-                        >= self._RP_ONE_M_UPDATE_INTERVAL
-                    ):
-                        rps_to_fetch_for_primary.append("rp_one_m")
-                        self._rp_one_m_last_update_times[node_id] = current_time
-
                     _LOGGER.debug(
-                        "Primary device %s: fetching RPs: %s",
+                        "Primary device %s: fetching telemetry (RP=%s)",
                         node_id,
-                        rps_to_fetch_for_primary,
+                        self._SUPPORTED_RETENTION_POLICY,
                     )
-                    # get_device_latest_data will fetch and MERGE into current_device_struct["_latest_data"]
-                    updated_device_with_telemetry = await self.get_device_latest_data(
-                        current_device_struct, rps_to_fetch_for_primary
-                    )
-                    # The above call modifies current_device_struct by reference if _latest_data is a dict within it.
-                    # For safety, we can reassign, though it should be the same object if modified in place.
-                    current_device_struct = updated_device_with_telemetry
+                    # Fetch and merge into current_device_struct["_latest_data"].
+                    await self.get_device_latest_data(current_device_struct)
 
                     # Fetch/update telemetry for children of this primary device
                     for child_device_struct in current_device_struct.get(
@@ -870,31 +800,14 @@ class EnirisHacsApiClient:
                         if not child_node_id:
                             continue
 
-                        rps_to_fetch_for_child: list[str] = ["rp_one_s"]
-                        last_rp_m_update_child = self._rp_one_m_last_update_times.get(
-                            child_node_id
-                        )
-                        if (
-                            not last_rp_m_update_child
-                            or (current_time - last_rp_m_update_child)
-                            >= self._RP_ONE_M_UPDATE_INTERVAL
-                        ):
-                            rps_to_fetch_for_child.append("rp_one_m")
-                            self._rp_one_m_last_update_times[child_node_id] = (
-                                current_time
-                            )
-
                         _LOGGER.debug(
-                            "Child device %s of %s: fetching RPs: %s",
+                            "Child device %s of %s: fetching telemetry (RP=%s)",
                             child_node_id,
                             node_id,
-                            rps_to_fetch_for_child,
+                            self._SUPPORTED_RETENTION_POLICY,
                         )
-                        # get_device_latest_data will merge into child_device_struct["_latest_data"]
-                        await self.get_device_latest_data(
-                            child_device_struct, rps_to_fetch_for_child
-                        )
-                        # child_device_struct is modified in place within current_device_struct._processed_children
+                        # Merge into child_device_struct["_latest_data"].
+                        await self.get_device_latest_data(child_device_struct)
 
                     # Mark parent as updated (for HA coordinator to see a change)
                     # The deepcopy below will make HA see it as a new object.
@@ -907,19 +820,14 @@ class EnirisHacsApiClient:
                     )
 
                 except Exception as e:
-                    _LOGGER.error(
-                        "Error processing device %s for telemetry: %s", node_id, e
+                    _LOGGER.exception(
+                        "Error processing device %s for telemetry", node_id
                     )
-                    # Optionally, still add the device structure without fresh telemetry if needed
-                    # processed_devices_output[node_id] = copy.deepcopy(current_device_struct)
 
         _LOGGER.info(
-            "Processed %s primary devices for Home Assistant with selective telemetry update.",
+            "Processed %s primary devices for Home Assistant.",
             len(processed_devices_output),
         )
-        # For debugging, log the state of a device's _latest_data if needed
-        # for node_id, dev_data in processed_devices_output.items():
-        #     _LOGGER.debug("Final _latest_data for %s: %s", node_id, dev_data.get("_latest_data"))
         return processed_devices_output
 
     async def close(self) -> None:
