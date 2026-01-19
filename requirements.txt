@@ -3,7 +3,7 @@ homeassistant==2025.2.5
 ha-ffmpeg==3.2.2
 pymicro-vad==1.0.1
 pyspeex-noise==1.0.2
-pycares==4.11.0
+pycares==5.0.1
 mutagen
 hassil
 home-assistant-intents==2025.2.26
